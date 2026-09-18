@@ -49,6 +49,8 @@ The following are a list of [Cargo features][cargo-features] that can be enabled
 - **chrono**: Enables converting a file's created at time to a [`DateTime<UTC>`].
 - **jiff**: Enables converting a file's created at time to a [`Timestamp`].
 - **extract**: Enables extracting file contents and verifying their checksums.
+- **gog**: Enables reassembling and verifying the files split apart by GOG.com
+  installers. Implies `extract`.
 
 # What this crate provides
 
@@ -113,6 +115,8 @@ mod compression;
 mod encryption;
 pub mod entry;
 pub mod error;
+#[cfg(feature = "gog")]
+pub mod gog;
 pub mod header;
 #[cfg(feature = "extract")]
 mod iterator;
