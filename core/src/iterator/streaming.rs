@@ -9,14 +9,14 @@ use flate2::{Decompress, FlushDecompress, Status};
 #[cfg(test)]
 use crate::entry::checksum::Checksum;
 use crate::{
-    Inno,
+    Inno, Source,
     entry::{
         CompressionFilter,
         checksum::{ChecksumHasher, ChecksumMismatchError},
     },
     error::InnoResult,
     iterator::ExtractEntry,
-    read::{chunk::Chunk, data_chunk::DataChunkReader},
+    read::{Embedded, chunk::Chunk, data_chunk::DataChunkReader},
 };
 
 /// How much is read and filtered at a time. Has to be the filters' own block,
@@ -37,8 +37,8 @@ pub(super) fn mismatch_to_io(error: ChecksumMismatchError) -> io::Error {
 }
 
 enum FilesReader<'reader, R: Read + Seek> {
-    Source(Option<&'reader mut R>),
-    Chunk(Option<DataChunkReader<&'reader mut R>>),
+    Source(Option<Source<'reader, R>>),
+    Chunk(Option<DataChunkReader<Source<'reader, R>>>),
 }
 
 impl<R: Read + Seek> FilesReader<'_, R> {
@@ -53,20 +53,20 @@ impl<R: Read + Seek> FilesReader<'_, R> {
         self
     }
 
-    fn to_chunk_mut(&mut self, data_offset: u64, chunk: &Chunk) -> InnoResult<&mut Self> {
+    fn to_chunk_mut(&mut self, chunk: &Chunk) -> InnoResult<&mut Self> {
         if let Self::Source(reader) = self
             && let Some(reader) = reader.take()
         {
-            let chunk_reader = DataChunkReader::new(reader, data_offset, chunk)?;
+            let chunk_reader = DataChunkReader::new(reader, chunk)?;
             *self = FilesReader::Chunk(Some(chunk_reader));
         }
 
         Ok(self)
     }
 
-    fn reinitialize(&mut self, data_offset: u64, chunk: &Chunk) -> InnoResult<&mut Self> {
+    fn reinitialize(&mut self, chunk: &Chunk) -> InnoResult<&mut Self> {
         self.to_source_mut();
-        self.to_chunk_mut(data_offset, chunk)
+        self.to_chunk_mut(chunk)
     }
 }
 
@@ -87,7 +87,6 @@ impl<R: Read + Seek> Read for FilesReader<'_, R> {
 /// exist at a time and [`Iterator`] cannot express it.
 pub struct StreamingFiles<'reader, R: Read + Seek> {
     reader: FilesReader<'reader, R>,
-    data_offset: u64,
     chunks: BTreeMap<u64, VecDeque<ExtractEntry>>,
     entries: VecDeque<ExtractEntry>,
     current_position: u64,
@@ -138,14 +137,20 @@ impl<'reader, R: Read + Seek> StreamingFiles<'reader, R> {
             })
             .collect();
 
+        let data_offset = inno
+            .inner
+            .setup_loader
+            .data_offset()
+            .try_into()
+            .unwrap_or_else(|_| unreachable!());
+
+        let source = match inno.slices.as_mut() {
+            Some(slices) => Source::Slices(slices),
+            None => Source::Embedded(Embedded::new(&mut inno.reader, data_offset)),
+        };
+
         Self {
-            reader: FilesReader::Source(Some(&mut inno.reader)),
-            data_offset: inno
-                .inner
-                .setup_loader
-                .data_offset()
-                .try_into()
-                .unwrap_or_else(|_| unreachable!()),
+            reader: FilesReader::Source(Some(source)),
             entries: VecDeque::new(),
             chunks,
             current_position: 0,
@@ -161,8 +166,7 @@ impl<'reader, R: Read + Seek> StreamingFiles<'reader, R> {
     #[cfg(test)]
     fn over(reader: &'reader mut R) -> Self {
         Self {
-            reader: FilesReader::Source(Some(reader)),
-            data_offset: 0,
+            reader: FilesReader::Source(Some(Source::Embedded(Embedded::new(reader, 0)))),
             chunks: BTreeMap::new(),
             entries: VecDeque::new(),
             current_position: 0,
@@ -197,10 +201,7 @@ impl<'reader, R: Read + Seek> StreamingFiles<'reader, R> {
 
             let entry = self.entries.pop_front()?;
 
-            if let Err(err) = self
-                .reader
-                .reinitialize(self.data_offset, entry.file_location().chunk())
-            {
+            if let Err(err) = self.reader.reinitialize(entry.file_location().chunk()) {
                 return Some(Err(err));
             }
 
@@ -219,10 +220,7 @@ impl<'reader, R: Read + Seek> StreamingFiles<'reader, R> {
         // A previous entry has already consumed this location, and a chunk
         // cannot rewind, so read it from the start again
         if target_offset < self.current_position {
-            if let Err(err) = self
-                .reader
-                .reinitialize(self.data_offset, entry.file_location().chunk())
-            {
+            if let Err(err) = self.reader.reinitialize(entry.file_location().chunk()) {
                 return Some(Err(err));
             }
 
