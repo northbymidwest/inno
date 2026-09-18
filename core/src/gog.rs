@@ -65,8 +65,9 @@ impl InstallerFile {
     /// files with identical paths and different contents; keeping only the
     /// path silently turns those into one file.
     ///
-    /// Files split into parts report `app`, which is where the script that
-    /// names them puts them.
+    /// Files split into parts have no constant: the script names them
+    /// relative to where the installer is unpacking, so there is nothing to
+    /// report and nothing for them to collide with.
     #[must_use]
     #[inline]
     pub fn root(&self) -> Option<&str> {
@@ -154,40 +155,54 @@ fn decompress_part(part: &[u8]) -> io::Result<Vec<u8>> {
 /// are already the answer.
 #[must_use]
 pub fn files(entries: &[File]) -> Vec<InstallerFile> {
-    plan(
-        entries
-            .iter()
-            .map(|entry| (entry.condition().before_install(), entry.destination())),
-    )
+    plan(entries.iter().map(|entry| Entry {
+        before_install: entry.condition().before_install(),
+        after_install: entry.condition().after_install(),
+        destination: entry.destination(),
+    }))
+}
+
+/// What [`plan`] needs to know about one file entry.
+struct Entry<'a> {
+    before_install: Option<&'a str>,
+    after_install: Option<&'a str>,
+    destination: Option<&'a str>,
 }
 
 /// The part of [`files`] that does not need a whole installer to test: each
 /// entry's `before_install` script and its own destination, in order.
-fn plan<'a>(
-    entries: impl Iterator<Item = (Option<&'a str>, Option<&'a str>)>,
-) -> Vec<InstallerFile> {
+fn plan<'a>(entries: impl Iterator<Item = Entry<'a>>) -> Vec<InstallerFile> {
     let mut files: Vec<InstallerFile> = Vec::new();
+    // The file parts are being added to, which is not always the last one:
+    // an ordinary entry can sit between two parts, and appending to whatever
+    // came last would put the part on that entry instead.
+    let mut open: Option<usize> = None;
     let mut remaining = 0_usize;
 
-    for (index, (script, destination)) in entries.enumerate() {
-        if let Some(start) = script.and_then(start_of_file) {
+    for (index, entry) in entries.enumerate() {
+        if let Some(start) = entry.before_install.and_then(start_of_file) {
             // A new file begins here whether or not the one before it got
             // all the parts it asked for. A count that overran would
             // otherwise swallow the next file's first part, turning one
             // wrong file into two.
             files.push(InstallerFile {
-                root: Some("app".to_string()),
+                root: None,
                 path: start.path,
                 checksum: start.checksum,
                 parts: vec![index],
                 compressed: true,
             });
+            open = Some(files.len() - 1);
             remaining = start.parts.saturating_sub(1);
             continue;
         }
 
+        // A part says so itself. Taking whatever follows until the count is
+        // spent would swallow an ordinary entry that happens to sit between
+        // two parts, losing that file and corrupting this one.
         if remaining > 0
-            && let Some(current) = files.last_mut()
+            && is_part(entry.after_install)
+            && let Some(current) = open.and_then(|at| files.get_mut(at))
         {
             current.parts.push(index);
             remaining -= 1;
@@ -197,7 +212,7 @@ fn plan<'a>(
         // Not part of a split file, so it is a file in its own right, stored
         // and named the ordinary way. An entry with nowhere to go is not a
         // file at all.
-        if let Some((root, path)) = destination.map(split_root)
+        if let Some((root, path)) = entry.destination.map(split_root)
             && !path.is_empty()
         {
             files.push(InstallerFile {
@@ -211,6 +226,14 @@ fn plan<'a>(
     }
 
     files
+}
+
+/// Whether an entry's `after_install` marks it as one part of a file.
+fn is_part(after_install: Option<&str>) -> bool {
+    after_install.is_some_and(|script| {
+        call_arguments(script, "after_install").is_some()
+            || call_arguments(script, "after_install_dependency").is_some()
+    })
 }
 
 struct Start {
@@ -330,7 +353,43 @@ fn call_arguments(code: &str, name: &str) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{call_arguments, plan};
+    use super::{Entry, call_arguments, plan};
+
+    /// An entry that starts a file: its script names it.
+    fn start(before_install: &str) -> Entry<'_> {
+        Entry {
+            before_install: Some(before_install),
+            after_install: Some("after_install('id', 1, 2)"),
+            destination: Some("{tmp}/ab/cd\\abcd"),
+        }
+    }
+
+    /// A further part of the file before it.
+    fn part<'a>() -> Entry<'a> {
+        Entry {
+            before_install: None,
+            after_install: Some("after_install('id', 1, 2)"),
+            destination: Some("{tmp}/ab/cd\\abcd"),
+        }
+    }
+
+    /// An ordinary entry, stored and named the usual way.
+    fn plain(destination: &str) -> Entry<'_> {
+        Entry {
+            before_install: None,
+            after_install: None,
+            destination: Some(destination),
+        }
+    }
+
+    /// An entry with nothing at all on it.
+    fn nothing<'a>() -> Entry<'a> {
+        Entry {
+            before_install: None,
+            after_install: None,
+            destination: None,
+        }
+    }
 
     #[test]
     fn a_call_gives_up_its_arguments() {
@@ -370,7 +429,7 @@ mod tests {
 
     #[test]
     fn a_single_part_file_is_one_entry() {
-        let files = plan([(Some("before_install('id', 'LOCO.EXE', 1)"), None)].into_iter());
+        let files = plan([start("before_install('id', 'LOCO.EXE', 1)")].into_iter());
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path(), "LOCO.EXE");
         assert_eq!(files[0].parts(), [0]);
@@ -382,10 +441,10 @@ mod tests {
         // the first says so.
         let files = plan(
             [
-                (Some("before_install('id', 'Manual.pdf', 3)"), None),
-                (None, None),
-                (None, None),
-                (Some("before_install('id2', 'pskill.exe', 1)"), None),
+                start("before_install('id', 'Manual.pdf', 3)"),
+                part(),
+                part(),
+                start("before_install('id2', 'pskill.exe', 1)"),
             ]
             .into_iter(),
         );
@@ -399,7 +458,7 @@ mod tests {
 
     #[test]
     fn a_backslash_path_becomes_a_normal_one() {
-        let files = plan([(Some(r"before_install('id', 'Data\20s1.dat', 1)"), None)].into_iter());
+        let files = plan([start(r"before_install('id', 'Data\20s1.dat', 1)")].into_iter());
         assert_eq!(files[0].path(), "Data/20s1.dat");
     }
 
@@ -408,14 +467,34 @@ mod tests {
         // The first entry of a real installer carries no script at all.
         let files = plan(
             [
-                (None, None),
-                (None, None),
-                (Some("before_install('id', 'a.txt', 1)"), None),
+                nothing(),
+                nothing(),
+                start("before_install('id', 'a.txt', 1)"),
             ]
             .into_iter(),
         );
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].parts(), [2]);
+    }
+
+    #[test]
+    fn an_ordinary_entry_between_two_parts_is_not_swallowed_as_one() {
+        // A part is marked by its own after_install. Counting off whatever
+        // follows until the count is spent takes this entry as part two,
+        // which loses it and corrupts the file it is taken into.
+        let files = plan(
+            [
+                start("before_install('id', 'split.bin', 2)"),
+                plain(r"{app}\innocent.txt"),
+                part(),
+            ]
+            .into_iter(),
+        );
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path(), "split.bin");
+        assert_eq!(files[0].parts(), [0, 2], "the real second part is entry 2");
+        assert_eq!(files[1].path(), "innocent.txt");
     }
 
     #[test]
@@ -425,9 +504,9 @@ mod tests {
         // this one. Both are wrong; only one of them is quiet.
         let files = plan(
             [
-                (Some("before_install('id', 'greedy.bin', 9)"), None),
-                (None, None),
-                (Some("before_install('id2', 'next.bin', 1)"), None),
+                start("before_install('id', 'greedy.bin', 9)"),
+                part(),
+                start("before_install('id2', 'next.bin', 1)"),
             ]
             .into_iter(),
         );
@@ -442,22 +521,15 @@ mod tests {
     fn a_part_count_of_zero_still_leaves_the_entry_it_names() {
         // Nothing in the format promises a sensible count, and a file with
         // no parts at all is not a file.
-        let files = plan(
-            [
-                (Some("before_install('id', 'odd.bin', 0)"), None),
-                (None, None),
-            ]
-            .into_iter(),
-        );
+        let files = plan([start("before_install('id', 'odd.bin', 0)"), part()].into_iter());
         assert_eq!(files[0].parts(), [0]);
     }
 
     #[test]
     fn the_checksum_of_the_finished_file_is_kept() {
         let files = plan(
-            [(
-                Some("before_install('5538B198F731ABA14ABAF401DDDDF13F', 'LOCO.EXE', 1)"),
-                None,
+            [start(
+                "before_install('5538B198F731ABA14ABAF401DDDDF13F', 'LOCO.EXE', 1)",
             )]
             .into_iter(),
         );
@@ -479,13 +551,13 @@ mod tests {
         encoder.write_all(original).unwrap();
         let compressed = encoder.finish().unwrap();
 
-        let file = &plan([(Some("before_install('id', 'x.bin', 1)"), None)].into_iter())[0];
+        let file = &plan([start("before_install('id', 'x.bin', 1)")].into_iter())[0];
         assert_eq!(file.assemble(&[compressed]).unwrap(), original);
     }
 
     #[test]
     fn a_part_that_is_not_a_zlib_stream_is_an_error_not_a_panic() {
-        let file = &plan([(Some("before_install('id', 'x.bin', 1)"), None)].into_iter())[0];
+        let file = &plan([start("before_install('id', 'x.bin', 1)")].into_iter())[0];
         assert!(file.assemble(&[b"not compressed at all".to_vec()]).is_err());
     }
 
@@ -496,8 +568,8 @@ mod tests {
         // Reading only the split files loses them without saying so.
         let files = plan(
             [
-                (Some("before_install('id', 'LOCO.EXE', 1)"), None),
-                (None, Some(r"{app}\Data\plugin.dat")),
+                start("before_install('id', 'LOCO.EXE', 1)"),
+                plain(r"{app}\Data\plugin.dat"),
             ]
             .into_iter(),
         );
@@ -512,7 +584,7 @@ mod tests {
     fn a_plain_entry_is_not_decompressed_on_the_way_out() {
         // Only GOG's own parts carry the extra zlib layer. Inflating an
         // ordinary entry would fail on every one of them.
-        let files = plan([(None, Some("{app}/readme.txt"))].into_iter());
+        let files = plan([plain("{app}/readme.txt")].into_iter());
         assert_eq!(
             files[0].assemble(&[b"plain bytes".to_vec()]).unwrap(),
             b"plain bytes"
@@ -521,13 +593,13 @@ mod tests {
 
     #[test]
     fn an_entry_with_nowhere_to_go_is_not_a_file() {
-        let files = plan([(None, None), (None, Some("{app}"))].into_iter());
+        let files = plan([nothing(), plain("{app}")].into_iter());
         assert!(files.is_empty());
     }
 
     #[test]
     fn assembling_the_wrong_number_of_parts_is_refused() {
-        let files = plan([(Some("before_install('id', 'split.bin', 3)"), None)].into_iter());
+        let files = plan([start("before_install('id', 'split.bin', 3)")].into_iter());
         assert!(files[0].assemble(&[b"only one".to_vec()]).is_err());
     }
 
@@ -536,13 +608,7 @@ mod tests {
         // GOG installers ship their icon under both {app} and {tmp}. Keeping
         // only the path makes them one file, and whichever is written second
         // wins.
-        let files = plan(
-            [
-                (None, Some(r"{app}\goggame.ico")),
-                (None, Some(r"{tmp}\goggame.ico")),
-            ]
-            .into_iter(),
-        );
+        let files = plan([plain(r"{app}\goggame.ico"), plain(r"{tmp}\goggame.ico")].into_iter());
 
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].path(), files[1].path());
@@ -550,14 +616,19 @@ mod tests {
     }
 
     #[test]
-    fn a_split_file_is_written_under_app() {
-        let files = plan([(Some("before_install('id', 'LOCO.EXE', 1)"), None)].into_iter());
-        assert_eq!(files[0].root(), Some("app"));
+    fn a_split_file_has_no_root_of_its_own() {
+        // Its script names it relative to where the installer unpacks, so
+        // there is no constant to report. Inventing one puts it in a
+        // directory of its own and, worse, makes it collide with the plain
+        // entry an installer sometimes has for the same file.
+        let files = plan([start("before_install('id', 'LOCO.EXE', 1)")].into_iter());
+        assert_eq!(files[0].root(), None);
+        assert_eq!(files[0].path(), "LOCO.EXE");
     }
 
     #[test]
     fn a_destination_with_no_constant_keeps_its_whole_path() {
-        let files = plan([(None, Some(r"plain\path.txt"))].into_iter());
+        let files = plan([plain(r"plain\path.txt")].into_iter());
         assert_eq!(files[0].root(), None);
         assert_eq!(files[0].path(), "plain/path.txt");
     }
@@ -566,13 +637,7 @@ mod tests {
     fn an_installer_that_is_not_gogs_is_read_as_plain_entries() {
         // Every entry carries its own destination and none is split, which
         // is what a plain Inno Setup installer looks like.
-        let files = plan(
-            [
-                (None, Some(r"{app}\a.txt")),
-                (None, Some(r"{tmp}\dir\b.txt")),
-            ]
-            .into_iter(),
-        );
+        let files = plan([plain(r"{app}\a.txt"), plain(r"{tmp}\dir\b.txt")].into_iter());
         assert_eq!(files.len(), 2);
         assert!(files.iter().all(|f| f.parts().len() == 1));
         assert_eq!(files[1].path(), "dir/b.txt");
