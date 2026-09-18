@@ -112,6 +112,7 @@ mod compression;
 mod encryption;
 pub mod entry;
 pub mod error;
+pub mod gog;
 pub mod header;
 #[cfg(feature = "extract")]
 mod iterator;
